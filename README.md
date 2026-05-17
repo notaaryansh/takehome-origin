@@ -32,7 +32,7 @@ Two-pass design.
 
 **Draft strategy.** We started with template-based drafts but could only confidently define templates for the 6 message shapes implied by the visible 8 items. The agent currently uses LLM-generated drafts. With domain data, the prod path is a hybrid: the LLM fills slots inside fixed templates rather than writing freely — eliminates clinical-advice and hallucination risk while preserving personalization.
 
-**Self-healing JSON parsing.** LLM JSON outputs sometimes drift from the expected schema (e.g., DOB returned as "3rd January 2024" instead of `YYYY-MM-DD`). Per-field validation raises a typed `ValueError` carrying the offending field, expected format, and actual value; that message is then sent back to the LLM in a follow-up turn so it can self-correct only the broken field, not regenerate the whole object.
+**Self-healing JSON parsing.** LLM JSON outputs sometimes drift from the expected schema (e.g., DOB returned as "3rd January 2024" instead of `YYYY-MM-DD`, or an out-of-enum classification). A `zod` schema validates every parsed response per-field; on failure, each `ZodIssue`'s `path` + message (up to 8) is appended to the conversation as a user-turn correction prompt asking the LLM to re-emit a corrected JSON object. Bounded retries: 3 attempts in enrichment, shared `MAX_ITERS` budget in the orchestrator. If validation never succeeds, enrichment falls back to a rule-based brief and the orchestrator emits a graceful manual-review `ItemOutput`, so the batch never crashes on one bad item. The retry currently asks for whole-object re-emission; a true field-level patch loop (validate, request just the broken keys, merge, re-validate) is in "another 4 hours".
 
 **Safety posture.** Safeguarding signals in the brief set an explicit override flag the orchestrator must honor (P0, escalate, neutral draft only); the override does not depend on the orchestrator's reasoning to fire. `tools_called[]` is reconstructed from the trace, not from any LLM self-report, so output ↔ audit drift is structurally impossible.
 
@@ -46,6 +46,34 @@ Per-item enrichment is expensive at scale, and a fully synchronous request/respo
 - **Queue-based execution** — Inbound queue → enrichment workers → orchestrator workers → action queue, with DLQs at each hop. Async by default; staff UI subscribes to the action queue rather than polling
 - **Evaluation harness** — golden set of ~200 items with expected `(classification, urgency, must-include-tools, must-not-include-tools)` plus an LLM-as-judge for draft quality (empathy, clinical-advice leakage, "we have scheduled" language). CI blocks release on regression
 - **Per-draft safety classifier** — a small last-line model that flags any clinical advice or sent-message language before staff sees the draft
+
+## Unit economics and scaling
+
+Current design makes **two LLM calls per item**: one Haiku enrichment + one Sonnet orchestrator session that runs 3–6 turns of tool-use. Per-item cost at observed token usage and Anthropic public pricing (~$1/$5 per M Haiku in/out, ~$3/$15 per M Sonnet in/out):
+
+| Stage | Model | Input tokens | Output tokens | Cost / item |
+|---|---|---|---|---|
+| Enrichment | Haiku 4.5 | ~3,500 (system prompt cached after first call) | ~800 | ~$0.005 |
+| Orchestrator (~5 turns avg) | Sonnet 4.5 | ~25,000 cumulative | ~1,500 | ~$0.10 |
+| **Total** | | | | **~$0.10 / item** |
+
+Naive scaling — every item processed the same way:
+
+| Volume | Cost / day | Cost / month |
+|---|---|---|
+| 100 / day (single practice) | $10 | $300 |
+| 1,000 / day (multi-practice) | $100 | $3,000 |
+| 10,000 / day (regional SaaS) | $1,000 | $30,000 |
+| 100,000 / day (enterprise) | $10,000 | $300,000 |
+
+At 100,000 items/day per-item LLM cost becomes the dominant operating expense and the naive design has to change. The optimizations that change the shape of the curve:
+
+- **Cluster before enrichment** — items sharing a sender, thread, or temporal window get a single shared brief; per-item orchestration only fires when individual action diverges. Realistic 3–10× reduction depending on inbox shape.
+- **Tiered routing** — when the brief's confidence is high and classification is unambiguous (obvious spam, clean in-network referral), skip Sonnet entirely and act from a rule table. Realistic 30–50% reduction.
+- **Aggressive prompt caching** — already on for enrichment, not yet on for the orchestrator. Realistic 30–50% input-cost reduction on the orchestrator side.
+- **Idempotency cache** — hash item body → cached result with TTL. Re-runs of identical items are free; trivial storage cost.
+
+Combined, these get per-item cost into the **$0.01–$0.03 range even at 100K/day**, putting unit economics in the same shape as the staff time displaced (typically $20–50 of staff cost per triaged item before any agent assistance).
 
 ## What I chose not to build, and why
 
